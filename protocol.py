@@ -43,34 +43,32 @@ Reference: https://en.bitcoin.it/wiki/Protocol_specification
     [ 4] VERSION                <i                                  int32_t
     [ 8] SERVICES               <Q                                  uint64_t
     [ 8] TIMESTAMP              <q                                  int64_t
-    [..] ADDR_RECV
-        [ADDR_PAYLOAD|ADDRV2_PAYLOAD] (without TIMESTAMP)
-    [..] ADDR_FROM
-        [ADDR_PAYLOAD|ADDRV2_PAYLOAD] (without TIMESTAMP)
+    [26] ADDR_RECV
+        [ 8] SERVICES           <Q                                  uint64_t
+        [16] IP_ADDR
+            [12] IPV6           (\x00 * 10 + \xFF * 2)              char[12]
+            [ 4] IPV4                                               char[4]
+        [ 2] PORT               >H                                  uint16_t
+    [26] ADDR_FROM
+        [ 8] SERVICES           <Q                                  uint64_t
+        [16] IP_ADDR
+            [12] IPV6           (\x00 * 10 + \xFF * 2)              char[12]
+            [ 4] IPV4                                               char[4]
+        [ 2] PORT               >H                                  uint16_t
     [ 8] NONCE                  <Q (random.getrandbits(64))         uint64_t
     [..] USER_AGENT             variable string
     [ 4] HEIGHT                 <i                                  int32_t
     [ 1] RELAY                  <? (since version >= 70001)         bool
 
-    [---ADDR_LIST_PAYLOAD---]
+    [---ADDR_PAYLOAD---]
     [..] COUNT                  variable integer
     [..] ADDR_LIST              multiple of COUNT (max 1000)
-        [ADDR_PAYLOAD|ADDRV2_PAYLOAD]
-
-    [---ADDR_PAYLOAD---]
-    [ 4] TIMESTAMP              <I                                  uint32_t
-    [ 8] SERVICES               <Q                                  uint64_t
-    [16] IP_ADDR
-        [12] IPV6               (\x00 * 10 + \xFF * 2)              char[12]
-        [ 4] IPV4                                                   char[4]
-    [ 2] PORT                   >H                                  uint16_t
-
-    [---ADDRV2_PAYLOAD---]
-    [ 4] TIMESTAMP              <I                                  uint32_t
-    [..] SERVICES               variable integer
-    [ 1] NETWORK_ID             <B                                  uint8_t
-    [..] ADDR                   variable integer up to 512 bytes
-    [ 2] PORT                   >H                                  uint16_t
+        [ 4] TIMESTAMP          <I                                  uint32_t
+        [ 8] SERVICES           <Q                                  uint64_t
+        [16] IP_ADDR
+            [12] IPV6           (\x00 * 10 + \xFF * 2)              char[12]
+            [ 4] IPV4                                               char[4]
+        [ 2] PORT               >H                                  uint16_t
 
     [---PING_PAYLOAD---]
     [ 8] NONCE                  <Q (random.getrandbits(64))         uint64_t
@@ -151,50 +149,23 @@ from binascii import hexlify, unhexlify
 from collections import deque
 from cStringIO import StringIO
 from io import SEEK_CUR
-from sha3 import sha3_256
+from operator import itemgetter
 
 MAGIC_NUMBER = "\xF9\xBE\xB4\xD9"
 PORT = 8333
 MIN_PROTOCOL_VERSION = 70001
-PROTOCOL_VERSION = 70016  # min. protocol version to accept sendaddrv2
+PROTOCOL_VERSION = 70015
 FROM_SERVICES = 0
 TO_SERVICES = 1  # NODE_NETWORK
-USER_AGENT = "/bitnodes.io:0.2/"
-HEIGHT = 668000
+USER_AGENT = "/bitnodes.io:0.1/"
+HEIGHT = 478000
 RELAY = 0  # set to 1 to receive all txs
 
 SOCKET_BUFSIZE = 8192
 SOCKET_TIMEOUT = 30
 HEADER_LEN = 24
 
-# ipv6 prefix for .onion address (use in addr message only)
-ONION_PREFIX = "\xFD\x87\xD8\x7E\xEB\x43"
-
-# reserved network IDs
-NETWORK_IPV4 = 1
-NETWORK_IPV6 = 2
-NETWORK_TORV2 = 3
-NETWORK_TORV3 = 4
-NETWORK_I2P = 5
-NETWORK_CJDNS = 6
-
-NETWORK_LENGTHS = {
-    NETWORK_IPV4: 4,
-    NETWORK_IPV6: 16,
-    NETWORK_TORV2: 10,
-    NETWORK_TORV3: 32,
-    NETWORK_I2P: 32,
-    NETWORK_CJDNS: 16,
-}
-
-SUPPORTED_NETWORKS = [
-    NETWORK_IPV4,
-    NETWORK_IPV6,
-    NETWORK_TORV2,
-    NETWORK_TORV3,
-]
-
-ONION_V3_LEN = 62
+ONION_PREFIX = "\xFD\x87\xD8\x7E\xEB\x43"  # ipv6 prefix for .onion address
 
 
 class ProtocolError(Exception):
@@ -225,18 +196,6 @@ class IncompatibleClientError(ProtocolError):
     pass
 
 
-class UnknownNetworkIdError(ProtocolError):
-    pass
-
-
-class UnsupportedNetworkIdError(ProtocolError):
-    pass
-
-
-class InvalidAddrLenError(ProtocolError):
-    pass
-
-
 class ReadError(ProtocolError):
     pass
 
@@ -251,25 +210,6 @@ class RemoteHostClosedConnection(ConnectionError):
 
 def sha256(data):
     return hashlib.sha256(data).digest()
-
-
-def addr_to_onion_v2(addr):
-    """
-    Returns .onion address for the specified v2 onion addr.
-    """
-    return b32encode(addr).lower() + '.onion'
-
-
-def addr_to_onion_v3(addr):
-    """
-    Returns .onion address for the specified v3 onion addr (PUBKEY).
-
-    onion_address = base32(PUBKEY | CHECKSUM | VERSION) + ".onion"
-    See https://gitweb.torproject.org/torspec.git/tree/rend-spec-v3.txt#n2135
-    """
-    version = b'\x03'
-    checksum = sha3_256('.onion checksum' + addr + version).digest()[:2]
-    return b32encode(addr + checksum + version).lower() + '.onion'
 
 
 def unpack(fmt, string):
@@ -311,13 +251,9 @@ class Serializer(object):
         if self.height is None:
             self.height = HEIGHT
         self.relay = conf.get('relay', RELAY)
-
         # This is set prior to throwing PayloadTooShortError exception to
         # allow caller to fetch more data over the network.
         self.required_len = 0
-
-        # Bump to 2 during handshake on receipt of sendaddrv2 message.
-        self.addr_version = None
 
     def serialize_msg(self, **kwargs):
         command = kwargs['command']
@@ -386,8 +322,6 @@ class Serializer(object):
             msg.update(self.deserialize_ping_payload(payload))
         elif msg['command'] == "addr":
             msg.update(self.deserialize_addr_payload(payload))
-        elif msg['command'] == "addrv2":
-            msg.update(self.deserialize_addr_payload(payload, version=2))
         elif msg['command'] == "inv":
             msg.update(self.deserialize_inv_payload(payload))
         elif msg['command'] == "tx":
@@ -419,10 +353,8 @@ class Serializer(object):
             struct.pack("<i", self.protocol_version),
             struct.pack("<Q", self.from_services),
             struct.pack("<q", int(time.time())),
-            self.serialize_network_address(
-                to_addr, version=self.addr_version),
-            self.serialize_network_address(
-                from_addr, version=self.addr_version),
+            self.serialize_network_address(to_addr),
+            self.serialize_network_address(from_addr),
             struct.pack("<Q", random.getrandbits(64)),
             self.serialize_string(self.user_agent),
             struct.pack("<i", self.height),
@@ -442,10 +374,8 @@ class Serializer(object):
         msg['services'] = unpack("<Q", data.read(8))
         msg['timestamp'] = unpack("<q", data.read(8))
 
-        msg['to_addr'] = self.deserialize_network_address(
-            data, version=self.addr_version)
-        msg['from_addr'] = self.deserialize_network_address(
-            data, version=self.addr_version)
+        msg['to_addr'] = self.deserialize_network_address(data)
+        msg['from_addr'] = self.deserialize_network_address(data)
 
         msg['nonce'] = unpack("<Q", data.read(8))
 
@@ -482,7 +412,7 @@ class Serializer(object):
             [self.serialize_network_address(addr) for addr in addr_list])
         return ''.join(payload)
 
-    def deserialize_addr_payload(self, data, version=None):
+    def deserialize_addr_payload(self, data):
         msg = {}
         data = StringIO(data)
 
@@ -490,7 +420,7 @@ class Serializer(object):
         msg['addr_list'] = []
         for _ in xrange(msg['count']):
             network_address = self.deserialize_network_address(
-                data, has_timestamp=True, version=version)
+                data, has_timestamp=True)
             msg['addr_list'].append(network_address)
 
         return msg
@@ -633,126 +563,57 @@ class Serializer(object):
 
         return msg
 
-    def serialize_network_address(self, addr, version=None):
+    def serialize_network_address(self, addr):
         network_address = []
-
         if len(addr) == 4:
             (timestamp, services, ip_address, port) = addr
             network_address.append(struct.pack("<I", timestamp))
         else:
             (services, ip_address, port) = addr
-
-        if ip_address.endswith('.onion'):
-            if len(ip_address) == ONION_V3_LEN:
-                network_id = NETWORK_TORV3
-            else:
-                network_id = NETWORK_TORV2
-        elif '.' in ip_address:
-            network_id = NETWORK_IPV4
+        network_address.append(struct.pack("<Q", services))
+        if ip_address.endswith(".onion"):
+            # convert .onion address to its ipv6 equivalent (6 + 10 bytes)
+            network_address.append(
+                ONION_PREFIX + b32decode(ip_address[:-6], True))
+        elif "." in ip_address:
+            # unused (12 bytes) + ipv4 (4 bytes) = ipv4-mapped ipv6 address
+            unused = "\x00" * 10 + "\xFF" * 2
+            network_address.append(
+                unused + socket.inet_pton(socket.AF_INET, ip_address))
         else:
-            network_id = NETWORK_IPV6
-
-        if version == 2:
-            network_address.append(self.serialize_int(services))
-
-            if network_id == NETWORK_TORV3:
-                # 32 bytes
-                network_address.append(b32decode(ip_address[:-6], True)[:32])
-            elif network_id == NETWORK_TORV2:
-                # 10 bytes
-                network_address.append(b32decode(ip_address[:-6], True))
-            elif network_id == NETWORK_IPV4:
-                # 4 bytes
-                network_address.append(
-                    socket.inet_pton(socket.AF_INET, ip_address))
-            else:
-                # 16 bytes
-                network_address.append(
-                    socket.inet_pton(socket.AF_INET6, ip_address))
-        else:
-            network_address.append(struct.pack("<Q", services))
-
-            if network_id == NETWORK_TORV2 or network_id == NETWORK_TORV3:
-                # convert .onion address to its ipv6 equivalent (6 + 10 bytes)
-                network_address.append(
-                    ONION_PREFIX + b32decode(ip_address[:-6], True))
-            elif network_id == NETWORK_IPV4:
-                # unused (12 bytes) + ipv4 (4 bytes) = ipv4-mapped ipv6 address
-                unused = "\x00" * 10 + "\xFF" * 2
-                network_address.append(
-                    unused + socket.inet_pton(socket.AF_INET, ip_address))
-            else:
-                # ipv6 (16 bytes)
-                network_address.append(
-                    socket.inet_pton(socket.AF_INET6, ip_address))
-
+            # ipv6 (16 bytes)
+            network_address.append(
+                socket.inet_pton(socket.AF_INET6, ip_address))
         network_address.append(struct.pack(">H", port))
-
         return ''.join(network_address)
 
-    def deserialize_network_address(self, data, has_timestamp=False,
-                                    version=None):
-        network_id = 0
-        ipv4 = ""
-        ipv6 = ""
-        onion = ""
-
+    def deserialize_network_address(self, data, has_timestamp=False):
         timestamp = None
         if has_timestamp:
             timestamp = unpack("<I", data.read(4))
 
-        if version == 2:
-            services = self.deserialize_int(data)
+        services = unpack("<Q", data.read(8))
 
-            network_id = unpack("<B", data.read(1))
+        _ipv6 = data.read(12)
+        _ipv4 = data.read(4)
+        port = unpack(">H", data.read(2))
+        _ipv6 += _ipv4
 
-            if network_id not in NETWORK_LENGTHS.keys():
-                raise UnknownNetworkIdError(
-                    "unknown network id {}".format(network_id))
+        ipv4 = ""
+        ipv6 = ""
+        onion = ""
 
-            if network_id not in SUPPORTED_NETWORKS:
-                raise UnsupportedNetworkIdError(
-                    "unsupported network id {}".format(network_id))
-
-            addr_len = self.deserialize_int(data)
-            if addr_len != NETWORK_LENGTHS[network_id]:
-                raise InvalidAddrLenError
-
-            addr = data.read(addr_len)
-            if network_id == NETWORK_TORV2:
-                onion = addr_to_onion_v2(addr)
-            elif network_id == NETWORK_TORV3:
-                onion = addr_to_onion_v3(addr)
-            elif network_id == NETWORK_IPV6:
-                ipv6 = socket.inet_ntop(socket.AF_INET6, addr)
-            elif network_id == NETWORK_IPV4:
-                ipv4 = socket.inet_ntop(socket.AF_INET, addr)
-
-            port = unpack(">H", data.read(2))
+        if _ipv6[:6] == ONION_PREFIX:
+            onion = b32encode(_ipv6[6:]).lower() + ".onion"  # use .onion
         else:
-            services = unpack("<Q", data.read(8))
-
-            _ipv6 = data.read(12)
-            _ipv4 = data.read(4)
-
-            port = unpack(">H", data.read(2))
-
-            _ipv6 += _ipv4
-            if _ipv6[:6] == ONION_PREFIX:
-                onion = addr_to_onion_v2(_ipv6[6:])  # use .onion
-                network_id = NETWORK_TORV2
+            ipv6 = socket.inet_ntop(socket.AF_INET6, _ipv6)
+            ipv4 = socket.inet_ntop(socket.AF_INET, _ipv4)
+            if ipv4 in ipv6:
+                ipv6 = ""  # use ipv4
             else:
-                ipv6 = socket.inet_ntop(socket.AF_INET6, _ipv6)
-                ipv4 = socket.inet_ntop(socket.AF_INET, _ipv4)
-                if ipv4 in ipv6:
-                    ipv6 = ""  # use ipv4
-                    network_id = NETWORK_IPV4
-                else:
-                    ipv4 = ""  # use ipv6
-                    network_id = NETWORK_IPV6
+                ipv4 = ""  # use ipv6
 
         return {
-            'network_id': network_id,
             'timestamp': timestamp,
             'services': services,
             'ipv4': ipv4,
@@ -968,9 +829,7 @@ class Connection(object):
             if msg.get('command') == "ping":
                 self.pong(msg['nonce'])  # respond to ping immediately
             elif msg.get('command') == "version":
-                # respond to version immediately
-                self.sendaddrv2()
-                self.verack()
+                self.verack()  # respond to version immediately
             msgs.append(msg)
         if len(msgs) > 0 and commands:
             msgs[:] = [m for m in msgs if m.get('command') in commands]
@@ -981,33 +840,19 @@ class Connection(object):
             self.serializer.protocol_version,
             version.get('version', PROTOCOL_VERSION))
 
-    def set_addrv2(self, sendaddrv2):
-        self.serializer.addr_version = 2 if sendaddrv2 else None
-
     def handshake(self):
         # [version] >>>
         msg = self.serializer.serialize_msg(
             command="version", to_addr=self.to_addr, from_addr=self.from_addr)
         self.send(msg)
 
-        # <<< [version 124 bytes] [sendaddrv2 24 bytes] [verack 24 bytes]
+        # <<< [version 124 bytes] [verack 24 bytes]
         gevent.sleep(1)
-        version_msg = {}
-        msgs = self.get_messages(commands=['version', 'sendaddrv2', 'verack'])
+        msgs = self.get_messages(length=148, commands=["version", "verack"])
         if len(msgs) > 0:
-            version_msg = next(
-                (msg for msg in msgs if msg['command'] == 'version'), {})
-            self.set_min_version(version_msg)
-            sendaddrv2_msg = next(
-                (msg for msg in msgs if msg['command'] == 'sendaddrv2'), None)
-            self.set_addrv2(sendaddrv2_msg)
-
-        return version_msg
-
-    def sendaddrv2(self):
-        # [sendaddrv2] >>>
-        msg = self.serializer.serialize_msg(command="sendaddrv2")
-        self.send(msg)
+            msgs[:] = sorted(msgs, key=itemgetter('command'), reverse=True)
+            self.set_min_version(msgs[0])
+        return msgs
 
     def verack(self):
         # [verack] >>>
@@ -1025,18 +870,14 @@ class Connection(object):
 
         # <<< [addr]..
         gevent.sleep(1)
-        msgs = self.get_messages(commands=['addr', 'addrv2'])
+        msgs = self.get_messages(commands=["addr"])
         return msgs
 
     def addr(self, addr_list):
-        if self.serializer.addr_version == 2:
-            # [addrv2] >>>
-            msg = self.serializer.serialize_msg(
-                command="addrv2", addr_list=addr_list)
-        else:
-            # [addr] >>>
-            msg = self.serializer.serialize_msg(
-                command="addr", addr_list=addr_list)
+        # addr_list = [(TIMESTAMP, SERVICES, "IP_ADDRESS", PORT),]
+        # [addr] >>>
+        msg = self.serializer.serialize_msg(
+            command="addr", addr_list=addr_list)
         self.send(msg)
 
     def ping(self, nonce=None):
@@ -1119,10 +960,9 @@ class Connection(object):
 
 def main():
     to_addr = ("88.99.167.175", PORT)
-
     to_services = TO_SERVICES
 
-    version_msg = {}
+    handshake_msgs = []
     addr_msgs = []
 
     conn = Connection(to_addr, to_services=to_services)
@@ -1131,7 +971,7 @@ def main():
         conn.open()
 
         print("handshake")
-        version_msg = conn.handshake()
+        handshake_msgs = conn.handshake()
 
         print("getaddr")
         addr_msgs = conn.getaddr()
@@ -1142,12 +982,12 @@ def main():
     print("close")
     conn.close()
 
-    if version_msg:
-        services = version_msg.get('services', 0)
+    if len(handshake_msgs) > 0:
+        services = handshake_msgs[0].get('services', 0)
         if services != to_services:
             print('services ({}) != {}'.format(services, to_services))
 
-    print(version_msg)
+    print(handshake_msgs)
     print(addr_msgs)
 
     return 0
